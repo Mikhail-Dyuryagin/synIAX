@@ -1,0 +1,140 @@
+#!/usr/bin/env perl
+#===============================================================================
+#
+#         FILE:syncIAXchanels  
+#
+#        USAGE: ./syncIAXchanels
+#
+#  DESCRIPTION: Приводит к соответствию две таблиц из БД для того что бы происходила регистрация 
+#  IAX каналов на всех указаных в таблице серверахх
+#
+#      OPTIONS: ---
+# REQUIREMENTS: Asterisk::config DBI
+#         BUGS: ---
+#        NOTES: ---
+#       AUTHOR: brestows (), brestows@gmail.com
+# ORGANIZATION: 
+#      VERSION: 1.0
+#      CREATED: 12/28/2016 01:21:58 PM
+#     REVISION: ---
+#===============================================================================
+
+use strict;
+use warnings;
+use utf8;
+use Sys::Hostname;
+use DBI;
+use Asterisk::config;
+use Data::Dumper;
+use Encode;
+binmode(STDOUT, 'utf8');
+
+my $dbConfigFile = '/etc/odbc.ini';
+my $hostname = hostname;
+
+my $dbdriver = 'Pg';
+my $dbhost = undef;
+my $dbport = undef;
+my $dbname = undef;
+my $dbpass = undef;
+my $dbuser = undef;
+
+die "Don't get hostname!" unless $hostname;
+my $authTable = $hostname."_iax";
+my $regTable = $hostname."_config";
+# Get DB auth data
+my $sip_conf = new Asterisk::config(file=>$dbConfigFile);
+my $section_list = $sip_conf->fetch_sections_list();
+foreach my $section (@$section_list) {
+	if ($section =~ m/asterisk/s){
+		my $exAttr = $sip_conf->fetch_keys_hashref(section=>$section);
+		exists $exAttr->{'Database'} ? $dbname=$exAttr->{'Database'}->[0] : die "Don't get DB name" ;     
+		exists $exAttr->{'Servername'} ? $dbhost=$exAttr->{'Servername'}->[0]: die "Don't get ServerName" ;
+		exists $exAttr->{'Username'} ? $dbuser=$exAttr->{'Username'}->[0] : die "Don't get user name" ; 
+		exists $exAttr->{'Password'} ?  $dbpass = $exAttr->{'Password'}->[0]: die "Don't get password" ;
+		exists $exAttr->{'Port'} ?  $dbport =  $exAttr->{'Port'}->[0]: die "Don't db server port" ;
+	}
+}
+
+my $db = DBI->connect("dbi:$dbdriver:dbname=$dbname;host=$dbhost;port=$dbport",$dbuser,$dbpass,{PrintError => 1}) or die " ERROR: ".DBI->errstr;
+# Get password for  auth to server 
+my $query = "SELECT secret FROM $authTable WHERE name = ?";
+my $dth = $db->prepare($query);
+$dth->execute($hostname);
+my $secret = $dth->fetchrow_array();
+$dth->finish();
+my @ip_list =();
+my $var_metric=50;
+my $reload_aster = undef;
+# Получаем список серверов где надо регестрироваться, исключая 
+# сервер на котором исполняется скрипт
+$query = "SELECT permit FROM $authTable WHERE name != ?";
+$dth = $db->prepare($query);
+$dth->execute($hostname);
+my $asList = $dth->fetchall_arrayref;
+$dth->finish();
+# Перебираем все полученные сервера и сверяем актуальность регистрационных данных
+foreach my $address (@$asList) {
+	my @tmp = split('/',$address->[0]);
+	my $ip = $tmp[0];
+	push @ip_list, $ip;
+	my $registerStr = "$hostname:$secret\@$ip";	
+	$query = "SELECT id,var_val FROM $regTable WHERE filename='iax.conf' AND category='general' AND var_name='register' AND var_val LIKE ?";
+	$dth = $db->prepare($query);
+	my $row = $dth->execute("%\@$ip");
+	# Если уже есть строка регистрации
+	if ($row > 0) {
+		my ($id_string, $cur_registerStr) = $dth->fetchrow_array();
+		$dth->finish();
+		unless ($cur_registerStr eq $registerStr) {
+			$query =  "UPDATE $regTable SET var_val=? WHERE id=?";	
+			$dth = $db->prepare($query);
+			$dth->execute($registerStr,$id_string);
+			$dth->finish();
+			$reload_aster = 1;	
+		}
+	# а вот тут ужее нет и мы ее должны добавить
+	} else {
+		#так как нет записи в БД то ресурсы по ее поиску нам более не нужны, освобождаем их
+		$dth->finish();
+		my $max_metric = "SELECT MAX(var_metric) FROM $regTable WHERE filename='iax.conf' AND category='general'";
+		$dth = $db->prepare($max_metric);
+		$dth->execute();
+		my $cur_max_metric = $dth->fetchrow_array();
+		if ($cur_max_metric >= $var_metric) {
+			$var_metric = $cur_max_metric+1;
+		}
+		$dth->finish();
+		$query = "INSERT INTO $regTable (cat_metric,var_metric,filename,category,var_name,var_val) VALUES(0,?,'iax.conf','general','register',?)";	
+		$dth=$db->prepare($query);
+		$dth->execute($var_metric,$registerStr);
+		$dth->finish();
+		$reload_aster = 1;
+	}
+
+}
+#Проверяем на наличие каналов которые уже удалены
+#но строка регистрации еще присутствует
+checkUnusedChannels();
+$db->disconnect;
+system("asterisk -rx reload") if $reload_aster;
+
+sub checkUnusedChannels {
+	my $sql = "SELECT id,var_val FROM $regTable WHERE filename='iax.conf' and category='general' and var_name='register'";
+	my $sth = $db->prepare($sql);	
+	$sth->execute();
+	my $rows = $sth->rows();
+	my $hash = $sth->fetchall_hashref('var_val');
+	$sth->finish();
+	foreach my $key (keys %$hash){
+		my @tmp= split('@',$key); my $ip = $tmp[1];
+		my $del = 0;
+		unless (grep $_ eq $ip, @ip_list) {
+			$sql = "DELETE FROM $regTable WHERE id=?";
+			$sth = $db->prepare($sql);
+			$sth->execute($hash->{$key}->{'id'});
+			$sth->finish();
+		    $reload_aster = 1;
+		}
+	}
+}
